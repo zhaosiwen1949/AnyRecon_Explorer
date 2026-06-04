@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# macOS
+.DS_Store
+
+# Claude Code 本地状态
+.claude/
+
+# 大点云文件
+*.ply
+
+# 录制的轨迹（保留目录占位）
+trajectories/*
+!trajectories/.gitkeep
