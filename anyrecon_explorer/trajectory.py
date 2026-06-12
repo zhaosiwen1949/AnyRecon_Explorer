@@ -7,16 +7,18 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
 
 import numpy as np
 
-SCHEMA_VERSION = 1
+# v2: 每帧位姿以 transform_matrix（OpenCV 格式 c2w 4x4）记录，参考 NeRF transforms.json
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -112,23 +114,122 @@ class TrajectoryRecorder:
         )
 
 
+# ---------------------------------------------------------- 位姿矩阵转换
+#
+# viser 相机内部即 OpenCV 约定：wxyz 给出 R_world_camera（相机系基向量在世界系下
+# 的表示，列为 +X 右 / +Y 下 / +Z 朝前），position 为相机中心。因此 OpenCV 格式
+# 的 c2w 矩阵直接为 [[R, position], [0, 0, 0, 1]]，无需任何坐标轴翻转。
+
+
+def quat_wxyz_to_matrix(wxyz) -> np.ndarray:
+    """w 在前的四元数 → 3x3 旋转矩阵 R_world_camera。"""
+    q = np.asarray(wxyz, dtype=np.float64)
+    n = float(np.linalg.norm(q))
+    if n == 0.0:
+        return np.eye(3)
+    w, x, y, z = q / n
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+
+
+def matrix_to_quat_wxyz(R) -> list[float]:
+    """3x3 旋转矩阵 → w 在前的四元数（w >= 0）。"""
+    R = np.asarray(R, dtype=np.float64)
+    tr = R[0, 0] + R[1, 1] + R[2, 2]
+    if tr > 0:
+        s = math.sqrt(tr + 1.0) * 2
+        w = 0.25 * s
+        x = (R[2, 1] - R[1, 2]) / s
+        y = (R[0, 2] - R[2, 0]) / s
+        z = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    q = np.array([w, x, y, z], dtype=np.float64)
+    n = float(np.linalg.norm(q)) or 1.0
+    q = q / n
+    if q[0] < 0:
+        q = -q
+    return [float(v) for v in q]
+
+
+def c2w_matrix(position, wxyz) -> list[list[float]]:
+    """由 position + wxyz 构造 OpenCV 格式 c2w 4x4 矩阵（按行的嵌套列表）。"""
+    M = np.eye(4, dtype=np.float64)
+    M[:3, :3] = quat_wxyz_to_matrix(wxyz)
+    M[:3, 3] = np.asarray(position, dtype=np.float64)
+    return [[float(v) for v in row] for row in M]
+
+
+def _frame_to_dict(f: Frame) -> dict:
+    """单帧序列化：位姿用 transform_matrix（OpenCV c2w），保留 t/fov/aspect 供回放。"""
+    return {
+        "t": f.t,
+        "fov": f.fov,
+        "aspect": f.aspect,
+        "transform_matrix": c2w_matrix(f.position, f.wxyz),
+    }
+
+
+def _frame_from_dict(fd: dict, version: int) -> Frame:
+    if version >= 2 or "transform_matrix" in fd:
+        M = np.asarray(fd["transform_matrix"], dtype=np.float64)
+        R = M[:3, :3]
+        position = [float(v) for v in M[:3, 3]]
+        wxyz = matrix_to_quat_wxyz(R)
+        # OpenCV 约定：+Z 为视线方向；以单位距离取注视点（仅用于回放结束后恢复轨道中心）
+        forward = R[:, 2]
+        look_at = [float(position[i] + forward[i]) for i in range(3)]
+        return Frame(
+            t=float(fd.get("t", 0.0)),
+            position=position,
+            wxyz=wxyz,
+            fov=float(fd.get("fov", 1.0)),
+            aspect=float(fd.get("aspect", 1.0)),
+            look_at=look_at,
+        )
+    # 旧版 v1：直接含 position/wxyz/look_at 字段
+    return Frame(**fd)
+
+
 def to_dict(frames: list[Frame], point_cloud: str, sample_rate_hz: float) -> dict:
     return {
         "version": SCHEMA_VERSION,
+        "camera_model": "OPENCV",
         "point_cloud": point_cloud,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "sample_rate_hz": sample_rate_hz,
         "frame_count": len(frames),
-        "frames": [asdict(f) for f in frames],
+        "frames": [_frame_to_dict(f) for f in frames],
     }
 
 
 def from_dict(d: dict) -> tuple[dict, list[Frame]]:
-    """解析轨迹字典，返回 (元信息, 帧列表)。version 升级时在此做迁移。"""
-    version = d.get("version", 1)
-    if version != SCHEMA_VERSION:
+    """解析轨迹字典，返回 (元信息, 帧列表)。兼容 v1（position/wxyz）与 v2（transform_matrix）。"""
+    version = int(d.get("version", 1))
+    if version > SCHEMA_VERSION:
         raise ValueError(f"不支持的轨迹版本: {version}")
-    frames = [Frame(**f) for f in d["frames"]]
+    frames = [_frame_from_dict(f, version) for f in d["frames"]]
     meta = {k: v for k, v in d.items() if k != "frames"}
     return meta, frames
 

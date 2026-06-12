@@ -16,7 +16,12 @@ import time
 import numpy as np
 import viser
 
-from anyrecon_explorer.ply_loader import downsample, load_ply
+from anyrecon_explorer.ply_loader import (
+    GaussianCloud,
+    PointCloud,
+    choose_indices,
+    load_ply,
+)
 from anyrecon_explorer.trajectory import (
     Frame,
     TrajectoryRecorder,
@@ -46,11 +51,11 @@ class App:
         self.traj_dir = os.path.abspath(TRAJ_DIR)
         os.makedirs(self.traj_dir, exist_ok=True)
 
-        # 点云状态
+        # 点云 / 3DGS 状态
         self.current_ply_rel: str | None = None
-        self.full_points: np.ndarray | None = None
-        self.full_colors: np.ndarray | None = None
-        self.pc_handle = None
+        self.full_cloud: PointCloud | GaussianCloud | None = None
+        self.scene_handle = None
+        self.shown_count = 0
         self.scene_center = np.zeros(3)
         self.scene_diag = 1.0
         self.rng = np.random.default_rng(0)
@@ -156,7 +161,7 @@ class App:
 
     def _frame_camera(self, client: viser.ClientHandle) -> None:
         """让客户端相机框住当前点云。"""
-        if self.full_points is None or len(self.full_points) == 0:
+        if self.full_cloud is None or self.full_cloud.count == 0:
             return
         offset = np.array([0.0, 0.0, self.scene_diag * 0.8 + 1e-3])
         with client.atomic():
@@ -225,69 +230,90 @@ class App:
             return
         self._set_status(f"加载中: {rel} ...")
         try:
-            points, colors, has_color = load_ply(full)
+            cloud = load_ply(full)
         except Exception as e:
             self._set_status(f"加载失败: {e}")
             return
-        if len(points) == 0:
+        if cloud.count == 0:
             self._set_status(f"文件没有点: {rel}")
             return
 
         self.current_ply_rel = rel
-        self.full_points = points
-        self.full_colors = colors
-        bbox_min = points.min(axis=0)
-        bbox_max = points.max(axis=0)
-        self.scene_center = (bbox_min + bbox_max) / 2.0
-        self.scene_diag = float(np.linalg.norm(bbox_max - bbox_min)) or 1.0
+        self.full_cloud = cloud
+        # 用 1–99 百分位包围盒做相机框选 / 默认尺度，避免极端离群点（floater）把场景撑大
+        lo = np.percentile(cloud.positions, 1.0, axis=0)
+        hi = np.percentile(cloud.positions, 99.0, axis=0)
+        self.scene_center = (lo + hi) / 2.0
+        self.scene_diag = float(np.linalg.norm(hi - lo)) or 1.0
 
-        # 按场景尺度重置点大小默认值（用户之后可在 GUI 中调整）
-        self._suppress_point_size_cb = True
-        try:
-            self.point_size_num.value = round(
-                max(self.scene_diag / 1000.0, 1e-4), 4
-            )
-        finally:
-            self._suppress_point_size_cb = False
+        is_gaussian = isinstance(cloud, GaussianCloud)
+        # 点大小仅对普通点云有意义；3DGS 由协方差决定大小，禁用该控件
+        self.point_size_num.disabled = is_gaussian
+        if not is_gaussian:
+            self._suppress_point_size_cb = True
+            try:
+                self.point_size_num.value = round(
+                    max(self.scene_diag / 1000.0, 1e-4), 4
+                )
+            finally:
+                self._suppress_point_size_cb = False
 
-        self._show_downsampled()
-        note = "" if has_color else "（无颜色，使用灰色）"
-        shown = len(self.pc_handle.points) if self.pc_handle is not None else 0
-        self._set_status(f"已加载 {rel}: {len(points):,} 点，显示 {shown:,} 点{note}")
+        self._render_cloud()
+        kind = "3DGS 高斯" if is_gaussian else "点云"
+        if is_gaussian:
+            note = ""
+        else:
+            note = "" if cloud.has_color else "（无颜色，使用灰色）"
+        self._set_status(
+            f"已加载 {rel}（{kind}）: {cloud.count:,} 个，显示 {self.shown_count:,} 个{note}"
+        )
 
         client = self._resolve_client()
         if client is not None:
             self._frame_camera(client)
 
-    def _show_downsampled(self) -> None:
-        """从缓存的全量数组按当前 Max points 降采样并渲染。"""
-        if self.full_points is None:
+    def _render_cloud(self) -> None:
+        """从缓存的全量数据按当前 Max points 降采样并渲染（点云或 3DGS）。"""
+        cloud = self.full_cloud
+        if cloud is None:
             return
-        max_points = int(self.max_points_num.value)
-        pts, cols = downsample(
-            self.full_points, self.full_colors, max_points, self.rng
-        )
-        if self.pc_handle is not None:
-            self.pc_handle.remove()
-        self.pc_handle = self.server.scene.add_point_cloud(
-            "/cloud",
-            points=pts,
-            colors=cols,
-            point_size=max(float(self.point_size_num.value), 1e-5),
-        )
+        idx = choose_indices(cloud.count, int(self.max_points_num.value), self.rng)
+        shown = cloud if idx is None else cloud.subsample(idx)
+        self.shown_count = shown.count
+        if self.scene_handle is not None:
+            self.scene_handle.remove()
+            self.scene_handle = None
+        if isinstance(shown, GaussianCloud):
+            self.scene_handle = self.server.scene.add_gaussian_splats(
+                "/cloud",
+                centers=shown.centers,
+                covariances=shown.covariances,
+                rgbs=shown.colors,
+                opacities=shown.opacities,
+            )
+        else:
+            self.scene_handle = self.server.scene.add_point_cloud(
+                "/cloud",
+                points=shown.points,
+                colors=shown.colors,
+                point_size=max(float(self.point_size_num.value), 1e-5),
+            )
 
     def _on_point_size_changed(self) -> None:
-        """热更新点大小，无需重建点云。"""
-        if self._suppress_point_size_cb or self.pc_handle is None:
+        """热更新点大小，无需重建点云（仅普通点云）。"""
+        if self._suppress_point_size_cb or self.scene_handle is None:
             return
-        self.pc_handle.point_size = max(float(self.point_size_num.value), 1e-5)
+        if not isinstance(self.full_cloud, PointCloud):
+            return
+        self.scene_handle.point_size = max(float(self.point_size_num.value), 1e-5)
 
     def _on_max_points_changed(self) -> None:
-        if self.full_points is None:
+        if self.full_cloud is None:
             return
-        self._show_downsampled()
-        shown = len(self.pc_handle.points)
-        self._set_status(f"显示 {shown:,} / {len(self.full_points):,} 点")
+        self._render_cloud()
+        self._set_status(
+            f"显示 {self.shown_count:,} / {self.full_cloud.count:,} 个"
+        )
 
     # --------------------------------------------------------------- 录制
 
@@ -483,15 +509,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="浏览器端点云浏览 + 相机轨迹录制（viser）"
     )
-    parser.add_argument("--dir", default=os.getcwd(), help="点云根目录（递归扫描 .ply）")
+    parser.add_argument(
+        "--dir",
+        default=".",
+        help="点云根目录（递归扫描 .ply）；相对路径按当前执行命令的目录解析",
+    )
     parser.add_argument("--host", default="127.0.0.1", help="服务监听地址")
     parser.add_argument("--port", type=int, default=8080, help="服务端口")
     parser.add_argument("--max-points", type=int, default=2_000_000, help="默认最大渲染点数")
     parser.add_argument("--sample-hz", type=float, default=30.0, help="默认轨迹采样频率")
     args = parser.parse_args()
 
-    if not os.path.isdir(args.dir):
-        parser.error(f"目录不存在: {args.dir}")
+    # 相对路径以“当前执行命令的目录”（cwd）为根解析；同时展开 ~
+    resolved_dir = os.path.abspath(os.path.expanduser(args.dir))
+    if not os.path.isdir(resolved_dir):
+        parser.error(
+            f"目录不存在: {resolved_dir}\n"
+            f"（输入参数 --dir={args.dir!r}，当前工作目录 {os.getcwd()!r}）"
+        )
+    args.dir = resolved_dir
 
     server = viser.ViserServer(host=args.host, port=args.port)
     App(server, root_dir=args.dir, max_points=args.max_points, sample_hz=args.sample_hz)

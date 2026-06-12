@@ -6,5 +6,4 @@ dependencies:
   - pip
   - numpy
   - pip:
-      - viser
-      - plyfile
+      - -e .

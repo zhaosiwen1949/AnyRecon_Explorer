@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anyrecon-explorer"
+version = "0.1.0"
+description = "浏览器端点云浏览 + 相机轨迹录制工具（viser）"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "viser",
+    "numpy",
+    "plyfile",
+]
+
+[project.scripts]
+anyrecon-explorer = "anyrecon_explorer.app:main"
+
+[tool.setuptools]
+packages = ["anyrecon_explorer"]
